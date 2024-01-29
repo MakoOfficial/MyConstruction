@@ -606,7 +606,7 @@ def build_position_embedding(pos_embed_type, feature_size, hidden_dim):
 
 def getUniAD():
     parser = argparse.ArgumentParser(description="UniAD Framework")
-    parser.add_argument("--config", default="../config.yaml")
+    parser.add_argument("--config", default="./config.yaml")
     args = parser.parse_known_args()[0]
 
     with open(args.config) as f:

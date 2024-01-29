@@ -139,6 +139,16 @@ def create_data_loader(train_df, val_df, train_root, val_root):
     return BAATrainDataset(train_df, train_root), BAAValDataset(val_df, val_root)
 
 
+def L1_penalty(net, alpha):
+    l1_penalty = torch.nn.L1Loss(size_average=False)
+    loss = 0
+    for param in net.MLP.parameters():
+        loss += torch.sum(torch.abs(param))
+    for param2 in net.classifier.parameters():
+        loss += torch.sum(torch.abs(param2))
+
+    return alpha * loss
+
 def train_fn(net, train_loader, loss_fn, epoch, optimizer):
     '''
     checkpoint is a dict
@@ -148,37 +158,70 @@ def train_fn(net, train_loader, loss_fn, epoch, optimizer):
 
     net.train()
     for batch_idx, data in enumerate(train_loader):
-        image, _ = data[0]
-        image = image.type(torch.FloatTensor).cuda()
+        image, gender = data[0]
+        image, gender = image.type(torch.FloatTensor).cuda(), gender.type(torch.FloatTensor).cuda()
 
-        # batch_size = len(data[1])
+        batch_size = len(data[1])
         # label = F.one_hot(data[1]-1, num_classes=230).float().cuda()
-        # label = (data[1] - 1).type(torch.LongTensor).cuda()
+        label = (data[1] - 1).type(torch.LongTensor).cuda()
 
         # zero the parameter gradients
         optimizer.zero_grad()
         # forward
-        featureOri, featureEcf, decoder_output = net(image)
-
-        loss = (1 - flags["alpha"]) * loss_fn(featureOri, decoder_output) + \
-               flags["alpha"] * loss_fn(featureEcf, decoder_output)
-        loss.backward()
+        y_pred = net(image, gender)
+        y_pred = y_pred.squeeze()
+        label = label.squeeze()
+        # print(y_pred)
+        # print(y_pred, label)
+        loss = loss_fn(y_pred, label)
+        # backward,calculate gradients
+        total_loss = loss + L1_penalty(net, 1e-5)
+        total_loss.backward()
         # backward,update parameter
         optimizer.step()
         batch_loss = loss.item()
 
         training_loss += batch_loss
-        total_size += 1
+        total_size += batch_size
     return training_loss / total_size
 
 
+def evaluate_fn(net, val_loader):
+    net.eval()
+
+    global mae_loss
+    global val_total_size
+    with torch.no_grad():
+        for batch_idx, data in enumerate(val_loader):
+            val_total_size += len(data[1])
+
+            image, gender = data[0]
+            image, gender = image.type(torch.FloatTensor).cuda(), gender.type(torch.FloatTensor).cuda()
+
+            label = data[1].cuda()
+
+            y_pred = net(image, gender)
+            # y_pred = net(image, gender)
+            y_pred = torch.argmax(y_pred, dim=1)+1
+
+            y_pred = y_pred.squeeze()
+            label = label.squeeze()
+
+            batch_loss = F.l1_loss(y_pred, label, reduction='sum').item()
+            # print(batch_loss/len(data[1]))
+            mae_loss += batch_loss
+    return mae_loss
+
 import time
-from models.model import Reconstruct
+from models.model import Reconstruct, Regression
 
 
 def map_fn(flags):
-    mymodel = Reconstruct().cuda()
-    train_set, _ = create_data_loader(train_df, valid_df, train_path, valid_path)
+    backbone = Reconstruct().cuda()
+    msg = backbone.load_state_dict(torch.load(checkpoint))
+    print(msg)
+    mymodel = Regression(backbone).cuda()
+    train_set, val_set = create_data_loader(train_df, valid_df, train_path, valid_path)
     print(train_set.__len__())
     train_loader = torch.utils.data.DataLoader(
         train_set,
@@ -189,16 +232,26 @@ def map_fn(flags):
         pin_memory=True
     )
 
-    loss_fn = nn.MSELoss()
+    val_loader = torch.utils.data.DataLoader(
+        val_set,
+        batch_size=flags['batch_size'],
+        shuffle=False,
+        num_workers=flags['num_workers'],
+        pin_memory=True
+    )
+
+    global best_loss
+    best_loss = float('inf')
+    # loss_fn = nn.MSELoss()
     # loss_fn = nn.L1Loss(reduction='sum')
-    # loss_fn = nn.CrossEntropyLoss(reduction='sum')
+    loss_fn = nn.CrossEntropyLoss(reduction='sum')
     lr = flags['lr']
 
-    wd = 1e-4
+    wd = 0
 
-    optimizer = torch.optim.Adam(mymodel.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(mymodel.parameters(), lr=lr, weight_decay=wd)
     #   optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay = wd)
-    scheduler = StepLR(optimizer, step_size=40, gamma=0.1)
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
 
     ## Trains
     for epoch in range(flags['num_epochs']):
@@ -207,29 +260,114 @@ def map_fn(flags):
         global total_size
         total_size = torch.tensor([0], dtype=torch.float32)
 
+        global mae_loss
+        mae_loss = torch.tensor([0], dtype=torch.float32)
+        global val_total_size
+        val_total_size = torch.tensor([0], dtype=torch.float32)
+
         start_time = time.time()
         train_fn(mymodel, train_loader, loss_fn, epoch, optimizer)
 
-        train_loss = training_loss / total_size
-        print(
-            f'training loss is {train_loss}, time : {time.time() - start_time}, lr:{optimizer.param_groups[0]["lr"]}')
-        scheduler.step()
+        evaluate_fn(mymodel, val_loader)
 
-    torch.save(mymodel.state_dict(), '/'.join([save_path, f'{model_name}.bin']))
+        train_loss, val_mae = training_loss / total_size, mae_loss / val_total_size
+        if val_mae < best_loss:
+            best_loss = val_mae
+            torch.save(mymodel.state_dict(), '/'.join([save_path, f'{model_name}.bin']))
+        print(
+            f'training loss is {train_loss}, val loss is {val_mae}, time : {time.time() - start_time}, lr:{optimizer.param_groups[0]["lr"]}')
+        scheduler.step()
+    print(f'best loss: {best_loss}')
+
+    train_test_dataset = BAAValDataset(train_df, train_path)
+    train_test_dataloader = torch.utils.data.DataLoader(
+        train_test_dataset,
+        batch_size=flags['batch_size'],
+        shuffle=False,
+        num_workers=flags['num_workers'],
+        pin_memory=True
+    )
+
+    # save log
+    with torch.no_grad():
+        train_record = [['label', 'pred']]
+        train_record_path = os.path.join(save_path, f"train_result.csv")
+        train_length = 0.
+        total_loss = 0.
+        mymodel.eval()
+        for idx, data in enumerate(train_test_dataloader):
+            image, gender = data[0]
+            image, gender = image.type(torch.FloatTensor).cuda(), gender.type(torch.FloatTensor).cuda()
+
+            batch_size = len(data[1])
+            label = data[1].cuda()
+
+            y_pred = mymodel(image, gender)
+
+            output = torch.argmax(y_pred, dim=1) + 1
+
+            output = torch.squeeze(output)
+            label = torch.squeeze(label)
+            for i in range(output.shape[0]):
+                train_record.append([label[i].item(), round(output[i].item(), 2)])
+            assert output.shape == label.shape, "pred and output isn't the same shape"
+
+            total_loss += F.l1_loss(output, label, reduction='sum').item()
+            train_length += batch_size
+        print(f"training dataset length :{train_length}")
+        print(f'final training loss: {round(total_loss / train_length, 3)}')
+        with open(train_record_path, 'w', newline='') as csvfile:
+            writer_train = csv.writer(csvfile)
+            for row in train_record:
+                writer_train.writerow(row)
+
+    with torch.no_grad():
+        val_record = [['label', 'pred']]
+        val_record_path = os.path.join(save_path, f"val_result.csv")
+        val_length = 0.
+        val_loss = 0.
+        mymodel.eval()
+        for idx, data in enumerate(val_loader):
+            image, gender = data[0]
+            image, gender = image.type(torch.FloatTensor).cuda(), gender.type(torch.FloatTensor).cuda()
+
+            batch_size = len(data[1])
+            label = data[1].cuda()
+
+            y_pred = mymodel(image, gender)
+
+            output = torch.argmax(y_pred, dim=1) + 1
+            if output.shape[0] != 1:
+                output = torch.squeeze(output)
+                label = torch.squeeze(label)
+            for i in range(output.shape[0]):
+                val_record.append([label[i].item(), round(output[i].item(), 2)])
+            # assert output.shape == label.shape, "pred and output isn't the same shape"
+
+            val_loss += F.l1_loss(output, label, reduction='sum').item()
+            val_length += batch_size
+        print(f"valid dataset length :{val_length}")
+        print(f'final val loss: {round(val_loss / val_length, 3)}')
+        with open(val_record_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            for row in val_record:
+                writer.writerow(row)
+# torch.save(mymodel.state_dict(), '/'.join([save_path, f'{model_name}.bin']))
 
 
 if __name__ == "__main__":
-    save_path = '../../autodl-tmp/Reconstruction'
+    save_path = '../../autodl-tmp/ReconstructionFinetune'
     os.makedirs(save_path, exist_ok=True)
-    model_name = f'Reconstruction'
+    model_name = f'ReconstructionFinetune'
+    checkpoint = '../models/modelsRecord/Reconstruction/Reconstruction_0.bin'
 
     flags = {}
     flags['lr'] = 5e-4
-    flags['batch_size'] = 8
+    flags['batch_size'] = 32
     flags['num_workers'] = 8
-    flags['num_epochs'] = 160
+    flags['num_epochs'] = 75
     flags['seed'] = 1
-    flags['alpha'] = 0.8
+    # flags['alpha'] = 0.8
 
     data_dir = '../../autodl-tmp/FirstRotate/'
     # data_dir = r'E:/code/archive/masked_1K_fold/fold_1'

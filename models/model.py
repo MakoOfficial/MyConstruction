@@ -87,10 +87,11 @@ class Reconstruct(nn.Module):
         featureOri = self.FeatureRepresentation(image) # [B, (C1+C2+C3+C4), H4, W4]
         featureEcf = self.ECA(featureOri) # [B, (C1+C2+C3+C4), H4, W4]
 
-        featureEcf_std = 20*(torch.norm(featureEcf.detach()) / featureEcf.shape[1])
-        noise = torch.normal(mean=0, std=featureEcf_std, size=featureEcf.shape).cuda()
+        # featureEcf_std = 20*(torch.norm(featureEcf.detach()) / featureEcf.shape[1])
+        # noise = torch.normal(mean=0, std=featureEcf_std, size=featureEcf.shape).cuda()
 
-        encoder_input = self.linearPreject((featureEcf + noise)) # [B, 256, H4, W4]
+        # encoder_input = self.linearPreject((featureEcf + noise)) # [B, 256, H4, W4]
+        encoder_input = self.linearPreject(featureEcf) # [B, 256, H4, W4]
         decoder_output = self.Transformer(encoder_input)
 
         return featureOri, featureEcf, decoder_output
@@ -105,6 +106,89 @@ class Reconstruct(nn.Module):
 
         return encoder_output
 
+
+class Conv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1,
+                 padding=None, groups=1, activation=True):
+        super(Conv, self).__init__()
+        padding = kernel_size // 2 if padding is None else padding
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride,
+                              padding, groups=groups, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU(inplace=True) if activation else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class Bottleneck(nn.Module):
+    def __init__(self, in_channels, out_channels, down_sample=False, groups=1):
+        super(Bottleneck, self).__init__()
+        stride = 2 if down_sample else 1
+        mid_channels = out_channels // 4
+        self.shortcut = Conv(in_channels, out_channels, kernel_size=1, stride=stride, activation=False) \
+            if in_channels != out_channels else nn.Identity()
+        self.conv = nn.Sequential(*[
+            Conv(in_channels, mid_channels, kernel_size=1, stride=1),
+            Conv(mid_channels, mid_channels, kernel_size=3, stride=stride, groups=groups),
+            Conv(mid_channels, out_channels, kernel_size=1, stride=1, activation=False)
+        ])
+
+    def forward(self, x):
+        y = self.conv(x) + self.shortcut(x)
+        return F.relu(y, inplace=True)
+
+
+class Regression(nn.Module):
+
+    def __init__(self, backbone) -> None:
+        super(Regression, self).__init__()
+        self.backbone = backbone
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        self.layer1 = self._make_stage(256, 512, down_sample=True, num_blocks=6)
+        self.layer2 = self._make_stage(512, 1024, down_sample=True, num_blocks=3)
+        self.out_channels = 1024
+        self.gender_encoder = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU()
+        )
+
+        self.MLP = nn.Sequential(
+            nn.Linear(in_features=1024 + 32, out_features=1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            # nn.Linear(512, 1)
+            # nn.Linear(512, 230)
+        )
+
+        self.classifier = nn.Linear(512, 228)
+
+
+    def _make_stage(self, in_channels, out_channels, down_sample, num_blocks):
+        layers = [Bottleneck(in_channels, out_channels, down_sample=down_sample)]
+        for _ in range(1, num_blocks):
+            layers.append(Bottleneck(out_channels, out_channels, down_sample=False))
+        return nn.Sequential(*layers)
+
+    def forward(self, x, gender):
+        # print(f"x is {x.shape}")
+        x = self.backbone.infer(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+
+        x = F.adaptive_avg_pool2d(x, 1)
+        x = torch.squeeze(x)
+        x = x.view(-1, self.out_channels)
+
+        gender_encode = self.gender_encoder(gender)
+
+        return self.classifier(self.MLP(torch.cat((x, gender_encode), dim=-1)))
 
 
 class MyRes50(nn.Module):
@@ -165,12 +249,21 @@ class MyRes50(nn.Module):
 
 if __name__ == '__main__':
     data = torch.ones((2, 3, 512, 512)).cuda()
-    model = Reconstruct().cuda()
+    gender = torch.ones((2, 1)).cuda()
+    backbone = Reconstruct().cuda()
+    msg = backbone.load_state_dict(torch.load('../../models/modelsRecord/Reconstruction/Reconstruction_0.bin'))
+    print(msg)
+    model = Regression(backbone).cuda()
     print(model)
-    featureOri, featureEcf, decoder_output = model(data)
-    print(f"featureOri.shape: {featureOri.shape}")
-    print(f"featureEcf.shape: {featureEcf.shape}")
-    print(f"decoder_output.shape: {decoder_output.shape}")
-    total = sum([param.nelement() for param in model.parameters() if param.requires_grad==True])
+    # featureOri, featureEcf, decoder_output = model(data)
+    # print(f"featureOri.shape: {featureOri.shape}")
+    # print(f"featureEcf.shape: {featureEcf.shape}")
+    # print(f"decoder_output.shape: {decoder_output.shape}")
+    pred = model(data, gender)
+    print(f'output shape: {pred.shape}')
+    # total = sum([param.nelement() for param in model.parameters() if param.requires_grad==True])
+    total = sum([param.nelement() for param in model.parameters()])
 
     print("Number of training parameter: %.2fM" % (total / 1e6))
+
+
