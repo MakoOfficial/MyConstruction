@@ -70,9 +70,13 @@ class Reconstruct(nn.Module):
 
 
     def FeatureRepresentation(self, x):
+        self.stage1.eval()
         feature1 = self.stage1(x)   # [B, C1, H1, H1]
+        self.stage2.eval()
         feature2 = self.stage2(feature1)    # [B, C2, H2, H2]
+        self.stage3.eval()
         feature3 = self.stage3(feature2)    # [B, C3, H3, H3]
+        self.stage4.eval()
         feature4 = self.stage4(feature3)    # [B, C4, H4, H4]
 
         scale1to4 = feature4.shape[-1] / feature1.shape[-1]
@@ -255,8 +259,8 @@ if __name__ == '__main__':
     data = torch.ones((2, 3, 512, 512)).cuda()
     gender = torch.ones((2, 1)).cuda()
     backbone = Reconstruct().cuda()
-    msg = backbone.load_state_dict(torch.load('../../models/modelsRecord/Reconstruction/Reconstruction_0.bin'))
-    print(msg)
+    # msg = backbone.load_state_dict(torch.load('../../models/modelsRecord/Reconstruction/Reconstruction_0.bin'))
+    # print(msg)
     model = Regression(backbone).cuda()
     print(model)
     # featureOri, featureEcf, decoder_output = model(data)

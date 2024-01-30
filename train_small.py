@@ -44,9 +44,8 @@ def train_fn(net, train_loader, loss_fn, epoch, optimizer):
     global total_size
     global training_loss
 
-    net.train()
     for batch_idx, data in enumerate(train_loader):
-        image, _ = data[0]
+        image = data[0]
         image = image.type(torch.FloatTensor).cuda()
 
         # batch_size = len(data[1])
