@@ -44,10 +44,14 @@ class Reconstruct(nn.Module):
         super(Reconstruct, self).__init__()
         backbone, target_channel = get_My_efficientnetb3_fusion()
         self.stage1 = nn.Sequential(*backbone[0])
+        self.stage1.eval()
         self.target_channel = target_channel
         self.stage2 = nn.Sequential(*backbone[1])
+        self.stage2.eval()
         self.stage3 = nn.Sequential(*backbone[2])
+        self.stage3.eval()
         self.stage4 = nn.Sequential(*backbone[3])
+        self.stage4.eval()
         # print(self.stage1)
         for param in self.stage1.parameters():
             param.requires_grad = False
